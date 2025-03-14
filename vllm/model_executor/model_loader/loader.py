@@ -9,6 +9,7 @@ import glob
 import inspect
 import itertools
 import math
+import multiprocessing
 import os
 import warnings
 from abc import ABC, abstractmethod
@@ -1322,6 +1323,14 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                     and aws_endpoint_url is not None):
                 os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
 
+        # Auto-configure concurrency based on world_size and thread count
+        cpu_count = multiprocessing.cpu_count()
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        logger.warning("Found %d CPU cores for RunaiModelStreamerLoader worker: %d/%d", cpu_count, tp_rank, tp_size)
+        concurrency_per_rank = math.floor(2 * cpu_count / tp_size)
+        logger.warning("Setting concurrency to %d RunaiModelStreamerLoader worker: %d/%d", concurrency_per_rank, tp_rank, tp_size)
+
     def _prepare_weights(self, model_name_or_path: str,
                          revision: Optional[str]) -> List[str]:
         """Prepare weights for the model.
@@ -1365,7 +1374,15 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             revision: str) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         hf_weights_files = self._prepare_weights(model_or_path, revision)
-        return runai_safetensors_weights_iterator(hf_weights_files)
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        num_weight_files = len(hf_weights_files)
+        weight_files_per_rank = math.ceil(num_weight_files / tp_size)
+        filtered_weights_files = hf_weights_files[tp_rank*weight_files_per_rank:min(num_weight_files,(tp_rank+1)*weight_files_per_rank)]
+        logger.warning("!! Preparing iterator for %d/%d: %d [%s]", tp_rank, tp_size, len(filtered_weights_files), ", ".join(filtered_weights_files))
+
+        return runai_safetensors_weights_iterator(filtered_weights_files)
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download model if necessary"""
